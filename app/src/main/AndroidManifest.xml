@@ -26,7 +26,6 @@
         android:name=".App"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="${app_name}"
         android:networkSecurityConfig="@xml/network_security_config"
         android:requestLegacyExternalStorage="true"
         android:supportsRtl="true"
@@ -329,6 +328,11 @@
         <!-- 文件管理 -->
         <activity
             android:name=".ui.file.FileManageActivity"
+            android:configChanges="orientation|screenSize"
+            android:hardwareAccelerated="true" />
+        <!-- AI 摘要设置 -->
+        <activity
+            android:name=".ui.config.AiSummaryConfigActivity"
             android:configChanges="orientation|screenSize"
             android:hardwareAccelerated="true" />
         <!-- 选择文件 -->
