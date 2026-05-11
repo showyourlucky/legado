@@ -19,12 +19,19 @@ jobs:
 
       - name: Configure signing
         run: |
+          echo "DEBUG: RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}"
+          echo "DEBUG: RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}"
+          echo "DEBUG: RELEASE_STORE_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}"
+          echo "DEBUG: RELEASE_KEY_PASSWORD length=${#RELEASE_KEY_PASSWORD}"
+          echo "DEBUG: RELEASE_STORE_PASSWORD length=${#RELEASE_STORE_PASSWORD}"
           cp .github/workflows/show-release-key.jks app/show-release-key.jks
           echo "" >> gradle.properties
           echo "RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}" >> gradle.properties
           echo "RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}" >> gradle.properties
           echo "RELEASE_STORE_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}" >> gradle.properties
           echo "RELEASE_STORE_FILE=show-release-key.jks" >> gradle.properties
+          echo "DEBUG: gradle.properties content:"
+          cat gradle.properties
 
       - name: Build app release APK
         run: ./gradlew assembleAppRelease --parallel --daemon
