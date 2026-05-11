@@ -68,6 +68,14 @@ class ZhanweifuContentEditDialog : BaseDialogFragment(R.layout.zhanweifu_dialog_
                 binding.zhanweifuRlLoading.gone()
             }
         }
+        // 观察只读状态：AI摘要缓存内容不允许编辑，但保留触摸滚动
+        viewModel.isReadOnlyLiveData.observe(viewLifecycleOwner) { isReadOnly ->
+            // keyListener=null 禁止键盘输入和输入法弹出，不影响触摸滚动
+            // 不设置 isEnabled=false，否则会同时禁用滚动
+            binding.zhanweifuContentView.keyListener = if (isReadOnly) null else android.text.method.TextKeyListener.getInstance()
+            // 只读时隐藏保存菜单项，避免误操作
+            binding.zhanweifuToolBar.menu.findItem(R.id.zhanweifu_menu_save)?.isVisible = !isReadOnly
+        }
         viewModel.contentStream.observe(viewLifecycleOwner) {
             binding.zhanweifuContentView.append(it)
         }
@@ -129,7 +137,10 @@ class ZhanweifuContentEditDialog : BaseDialogFragment(R.layout.zhanweifu_dialog_
 
     override fun onCancel(dialog: DialogInterface) {
         super.onCancel(dialog)
-        zhanweifuSave()
+        // 只读模式（显示AI摘要）时不保存，避免污染用户编辑内容
+        if (viewModel.isReadOnlyLiveData.value != true) {
+            zhanweifuSave()
+        }
     }
 
     private fun zhanweifuSave() {
@@ -147,6 +158,8 @@ class ZhanweifuContentEditDialog : BaseDialogFragment(R.layout.zhanweifu_dialog_
     class ZhanweifuContentEditViewModel(application: Application) : BaseViewModel(application) {
         val loadStateLiveData = MutableLiveData<Boolean>()
         val contentStream = MutableLiveData<String>()
+        // true 表示当前显示的是 AI 摘要缓存，不允许编辑
+        val isReadOnlyLiveData = MutableLiveData<Boolean>(false)
 
         fun zhanweifuInitContent(reset: Boolean = false, success: (String) -> Unit) {
             Log.d("AiSummary", "ViewModel::zhanweifuInitContent (内容初始化开始)")
@@ -160,16 +173,21 @@ class ZhanweifuContentEditDialog : BaseDialogFragment(R.layout.zhanweifu_dialog_
                     Log.d("AiSummary", "ViewModel::zhanweifuInitContent - (重置内容)")
                     ZhanweifuBookHelp.zhanweifuDelContent(book, chapter)
                     ZhanweifuBookHelp.delAiSummaryCache(book, chapter)
+                    isReadOnlyLiveData.postValue(false)
                 }
 
                 val dialogContent = ZhanweifuBookHelp.zhanweifuGetContent(book, chapter)
                 if (!dialogContent.isNullOrEmpty()) {
+                    // 用户自己编辑过的内容，允许继续编辑
+                    isReadOnlyLiveData.postValue(false)
                     withContext(Dispatchers.Main) { success.invoke(dialogContent) }
                     return@execute
                 }
 
                 val cachedSummary = ZhanweifuBookHelp.getAiSummaryFromCache(book, chapter)
                 if (!cachedSummary.isNullOrEmpty()) {
+                    // AI 摘要缓存，只读展示，不允许编辑
+                    isReadOnlyLiveData.postValue(true)
                     withContext(Dispatchers.Main) { success.invoke(cachedSummary) }
                     return@execute
                 }
@@ -181,23 +199,25 @@ class ZhanweifuContentEditDialog : BaseDialogFragment(R.layout.zhanweifu_dialog_
                 }
                 
                 loadStateLiveData.postValue(true)
+                // AI 实时生成时先设为只读，生成完成后保持只读
+                isReadOnlyLiveData.postValue(true)
                 val summaryBuilder = StringBuilder()
                 ZhanweifuBookHelp.getAiSummary(
                     content = chapterContent,
-                    onResponse = { 
+                    onResponse = {
                         contentStream.postValue(it)
                         summaryBuilder.append(it)
                     },
-                    onFinish = { 
+                    onFinish = {
                         loadStateLiveData.postValue(false)
                         val finalSummary = summaryBuilder.toString()
                         if (finalSummary.isNotEmpty()) {
                             ZhanweifuBookHelp.saveAiSummaryToCache(book, chapter, finalSummary)
                         }
                     },
-                    onError = { 
+                    onError = {
                         loadStateLiveData.postValue(false)
-                        contentStream.postValue("\n\n[请求失败: $it]") 
+                        contentStream.postValue("\n\n[请求失败: $it]")
                     }
                 )
 
