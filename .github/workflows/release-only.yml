@@ -42,7 +42,7 @@ jobs:
           CONTENT_JSON=$(echo "$UPDATED_CONTENT" | jq -Rs . 2>/dev/null || echo "\"Error generating update content\"")
           echo "body=$CONTENT_JSON" >> $GITHUB_OUTPUT
 
-      - id: set-ver
+      - id: set-update
         run: |
           if [ -n "$UPDATED_CONTENT" ]; then
             echo "updated=yes" >> $GITHUB_OUTPUT
