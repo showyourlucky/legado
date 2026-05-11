@@ -23,3 +23,8 @@ projectdocument.txt
 commit_message.txt
 .cxx
 .vscode
+.android/
+.claude/
+.gradle-home/
+openspec/
+.codex/
