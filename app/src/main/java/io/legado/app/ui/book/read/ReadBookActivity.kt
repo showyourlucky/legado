@@ -13,12 +13,14 @@ import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
 import androidx.activity.addCallback
+import androidx.activity.viewModels
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.view.get
 import androidx.core.view.size
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.jaredrummler.android.colorpicker.ColorPickerDialogListener
 import io.legado.app.BuildConfig
 import io.legado.app.R
@@ -58,6 +60,7 @@ import io.legado.app.lib.dialogs.selector
 import io.legado.app.lib.theme.accentColor
 import io.legado.app.model.ReadAloud
 import io.legado.app.model.ReadBook
+import io.legado.app.model.webBook.WebBook
 import io.legado.app.model.analyzeRule.AnalyzeRule
 import io.legado.app.model.analyzeRule.AnalyzeRule.Companion.setChapter
 import io.legado.app.model.analyzeRule.AnalyzeRule.Companion.setCoroutineContext
@@ -72,7 +75,13 @@ import io.legado.app.service.BaseReadAloudService
 import io.legado.app.ui.about.AppLogDialog
 import io.legado.app.ui.book.bookmark.BookmarkDialog
 import io.legado.app.ui.book.changesource.ChangeBookSourceDialog
+import io.legado.app.ui.book.changesource.AutoCycleCandidate
+import io.legado.app.ui.book.changesource.ChangeBookSourceViewModel
+import io.legado.app.ui.book.changesource.AutoCycleState
+import io.legado.app.ui.book.changesource.AutoCycleStatus
+import io.legado.app.ui.book.changesource.AutoCycleStepResult
 import io.legado.app.ui.book.changesource.ChangeChapterSourceDialog
+import io.legado.app.ui.book.changesource.ChangeSourceAutoCycleMatcher
 import io.legado.app.ui.book.info.BookInfoActivity
 import io.legado.app.ui.book.read.config.AutoReadDialog
 import io.legado.app.ui.book.read.config.BgTextConfigDialog.Companion.BG_COLOR
@@ -134,9 +143,11 @@ import io.legado.app.utils.toastOnUi
 import io.legado.app.utils.visible
 import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.Dispatchers.Main
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.core.net.toUri
@@ -265,6 +276,9 @@ class ReadBookActivity : BaseReadBookActivity(),
     }
     private var justInitData: Boolean = false
     private var syncDialog: AlertDialog? = null
+    private val changeSourceViewModel: ChangeBookSourceViewModel by viewModels()
+    private var autoChangeSourceJob: Job? = null
+    private var autoChangeSourceDiffDialog: AlertDialog? = null
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onActivityCreated(savedInstanceState: Bundle?) {
@@ -273,6 +287,8 @@ class ReadBookActivity : BaseReadBookActivity(),
         binding.cursorRight.setColorFilter(accentColor)
         binding.cursorLeft.setOnTouchListener(this)
         binding.cursorRight.setOnTouchListener(this)
+        initAutoChangeSourceActions()
+        observeAutoChangeSourceStatus()
         window.setBackgroundDrawable(null)
         upScreenTimeOut()
         ReadBook.register(this)
@@ -1115,6 +1131,47 @@ class ReadBookActivity : BaseReadBookActivity(),
         }
     }
 
+    override fun changeTo(
+        source: BookSource,
+        book: Book,
+        toc: List<BookChapter>,
+        onSuccess: (() -> Unit)?
+    ) {
+        if (!book.isAudio) {
+            // 自动试切进行中时只加载当前章，跳过前后章和预下载
+            val isAutoCycle =
+                changeSourceViewModel.autoCycleStatus.value.state == AutoCycleState.Running
+            viewModel.changeTo(book, toc, loadContent = !isAutoCycle, onSuccess = onSuccess)
+        } else {
+            changeTo(source, book, toc)
+            onSuccess?.invoke()
+        }
+    }
+
+    override fun startAutoChangeSource() {
+        lifecycleScope.launch {
+            val prepared = withContext(IO) {
+                changeSourceViewModel.prepareAutoCycle(ReadBook.book?.bookUrl)
+            }
+                .getOrElse {
+                    AppLog.put("自动更换源准备失败\n${it.localizedMessage}", it, true)
+                    showAutoChangeSourceStatusMessage(
+                        it.localizedMessage ?: getString(R.string.auto_change_source_prepare_failed),
+                        showButtons = false
+                    )
+                    false
+                }
+            if (!prepared) {
+                showAutoChangeSourceStatusMessage(
+                    getString(R.string.auto_change_source_menu_hint),
+                    showButtons = false
+                )
+                return@launch
+            }
+            startAutoChangeSourceLoop()
+        }
+    }
+
     override fun replaceContent(content: String) {
         ReadBook.book?.let {
             viewModel.saveContent(it, content)
@@ -1720,6 +1777,9 @@ class ReadBookActivity : BaseReadBookActivity(),
     }
 
     override fun onDestroy() {
+        autoChangeSourceJob?.cancel()
+        changeSourceViewModel.stopSearch()
+        changeSourceViewModel.clearAutoCycleState()
         super.onDestroy()
         tts?.clearTts()
         textActionMenu.dismiss()
@@ -1821,6 +1881,290 @@ class ReadBookActivity : BaseReadBookActivity(),
                     loadChapterList(it)
                 }
             }
+        }
+    }
+
+    private fun initAutoChangeSourceActions() {
+        binding.btnAutoChangeSourceStop.setOnClickListener {
+            stopAutoChangeSource(getString(R.string.auto_change_source_stop))
+        }
+        binding.btnAutoChangeSourcePreview.setOnClickListener {
+            showAutoChangeSourcePreview()
+        }
+        binding.btnAutoChangeSourceDiff.setOnClickListener {
+            showAutoChangeSourceDiffWithBaseline()
+        }
+        binding.btnAutoChangeSourcePause.setOnClickListener {
+            if (changeSourceViewModel.isAutoCyclePaused()) {
+                changeSourceViewModel.continueAutoCycle()
+                startAutoChangeSourceLoop()
+            } else {
+                changeSourceViewModel.pauseAutoCycle(getString(R.string.auto_change_source_pause))
+            }
+        }
+    }
+
+    private fun observeAutoChangeSourceStatus() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                changeSourceViewModel.autoCycleStatus.collect { status ->
+                    renderAutoChangeSourceStatus(status)
+                }
+            }
+        }
+    }
+
+    private fun renderAutoChangeSourceStatus(status: AutoCycleStatus) {
+        // 只有 Running 和 Paused 状态显示面板，Stopped 和 Completed/Idle 都隐藏
+        val showPanel = status.state == AutoCycleState.Running || status.state == AutoCycleState.Paused
+        val showActions = status.state == AutoCycleState.Running || status.state == AutoCycleState.Paused
+        binding.autoChangeSourceActions.visibility = if (showPanel) View.VISIBLE else View.GONE
+        binding.autoChangeSourceButtonRow.visibility = if (showActions) View.VISIBLE else View.GONE
+        updateAutoChangeSourcePauseButton(status.state)
+        val statusText = when (status.state) {
+            AutoCycleState.Running -> {
+                if (status.currentIndex > 0 && status.total > 0 && status.sourceName.isNotBlank()) {
+                    getString(
+                        R.string.auto_change_source_running,
+                        status.currentIndex,
+                        status.total,
+                        status.sourceName
+                    )
+                } else {
+                    status.message
+                }
+            }
+
+            AutoCycleState.Paused -> status.message.ifBlank {
+                getString(R.string.auto_change_source_paused, status.sourceName)
+            }
+
+            AutoCycleState.Completed, AutoCycleState.Stopped -> status.message
+            AutoCycleState.Idle -> ""
+        }.ifBlank { status.lastSkipReason }
+        binding.tvAutoChangeSourceStatus.text = statusText
+    }
+
+    private fun startAutoChangeSourceLoop() {
+        autoChangeSourceJob?.cancel()
+        autoChangeSourceJob = lifecycleScope.launch {
+            while (true) {
+                if (changeSourceViewModel.isAutoCyclePaused()) {
+                    break
+                }
+                when (val step = withContext(IO) {
+                    changeSourceViewModel.evaluateNextAutoCycleCandidate()
+                }) {
+                    is AutoCycleStepResult.Candidate -> {
+                        if (!step.sameAsCurrent) {
+                            changeSourceViewModel.pauseAutoCycleForCandidate(step.candidate)
+                            updateAutoChangeSourcePauseButton(AutoCycleState.Paused)
+                        }
+                        showAutoChangeSourceDiff(step.candidate, step.sameAsCurrent)
+                        // 关键修复：用户可能在 changeTo 的网络请求期间点击"暂停"，
+                        // 但 onAutoCycleCandidateApplied(sameAsCurrent=true)
+                        // 会在回调里把状态无条件覆盖回 Running，导致暂停被吞掉。
+                        // 方案：在 await 前监听暂停 flow，await 后恢复暂停状态。
+                        val pauseMessage = getString(R.string.auto_change_source_pause)
+                        var userPausedDuringChangeTo = changeSourceViewModel.isAutoCyclePaused()
+                        val pauseCollectJob = lifecycleScope.launch {
+                            changeSourceViewModel.autoCycleStatus.collect { status ->
+                                if (status.state == AutoCycleState.Paused
+                                    && status.message == pauseMessage
+                                ) {
+                                    userPausedDuringChangeTo = true
+                                }
+                            }
+                        }
+                        val changeFinished = CompletableDeferred<Unit>()
+                        changeTo(step.candidate.source, step.candidate.book, step.candidate.toc) {
+                            changeSourceViewModel.onAutoCycleCandidateApplied(
+                                step.candidate,
+                                step.sameAsCurrent
+                            )
+                            changeFinished.complete(Unit)
+                        }
+                        changeFinished.await()
+                        pauseCollectJob.cancel()
+                        // 恢复被 onAutoCycleCandidateApplied 覆盖掉的用户暂停意图
+                        if (userPausedDuringChangeTo) {
+                            changeSourceViewModel.pauseAutoCycle(pauseMessage)
+                        }
+                        if (changeSourceViewModel.isAutoCyclePaused()) {
+                            break
+                        }
+                    }
+
+                    AutoCycleStepResult.Finished -> break
+                }
+            }
+        }
+    }
+
+    private fun stopAutoChangeSource(message: String) {
+        autoChangeSourceJob?.cancel()
+        autoChangeSourceDiffDialog?.dismiss()
+        autoChangeSourceDiffDialog = null
+        changeSourceViewModel.stopAutoCycle(message)
+    }
+
+    private fun updateAutoChangeSourcePauseButton(state: AutoCycleState) {
+        binding.btnAutoChangeSourcePause.text = getString(
+            if (state == AutoCycleState.Paused) {
+                R.string.auto_change_source_resume
+            } else {
+                R.string.auto_change_source_pause
+            }
+        )
+    }
+
+    private fun showAutoChangeSourceStatusMessage(message: String, showButtons: Boolean) {
+        binding.autoChangeSourceActions.visibility = View.VISIBLE
+        binding.autoChangeSourceButtonRow.visibility = if (showButtons) View.VISIBLE else View.GONE
+        binding.tvAutoChangeSourceStatus.text = message
+    }
+
+    private fun showAutoChangeSourcePreview() {
+        lifecycleScope.launch {
+            val previewResult = kotlin.runCatching {
+                changeSourceViewModel.getAutoCycleCurrentDisplayPreview()
+                    .ifBlank {
+                        throw NoStackTraceException(getString(R.string.auto_change_source_preview_empty))
+                    }
+            }
+            alert(title = getString(R.string.auto_change_source_preview_title)) {
+                setMessage(
+                    if (previewResult.isSuccess) {
+                        previewResult.getOrNull().orEmpty()
+                    } else {
+                        previewResult.exceptionOrNull()?.localizedMessage?.takeIf { it.isNotBlank() }
+                            ?: getString(R.string.auto_change_source_preview_empty)
+                    }
+                )
+                okButton()
+            }
+        }
+    }
+
+    /**
+     * 查看当前正文与基准内容的差异
+     * 无差异时弹框 5 秒后自动消失，有差异则保持直到手动关闭
+     */
+    private fun showAutoChangeSourceDiffWithBaseline() {
+        val book = ReadBook.book ?: return
+        val baselineDisplayPreview = changeSourceViewModel.getAutoCycleCurrentDisplayPreview()
+        if (baselineDisplayPreview.isBlank()) {
+            alert(title = getString(R.string.auto_change_source_diff_title)) {
+                setMessage(getString(R.string.auto_change_source_preview_empty))
+                okButton()
+            }
+            return
+        }
+        lifecycleScope.launch {
+            val loadingDialog = alert(title = getString(R.string.auto_change_source_diff_title)) {
+                setMessage(getString(R.string.auto_change_source_preview_loading))
+                noButton()
+            }
+            val result = kotlin.runCatching {
+                withContext(IO) {
+                    val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, book.durChapterIndex)
+                        ?: throw NoStackTraceException("当前章节不存在")
+                    val nextChapterUrl = appDb.bookChapterDao
+                        .getChapter(book.bookUrl, book.durChapterIndex + 1)?.url
+                    val source = appDb.bookSourceDao.getBookSource(book.origin)
+                        ?: throw NoStackTraceException("当前书源不存在")
+                    val content = BookHelp.getContent(book, chapter)
+                        ?: WebBook.getContentAwait(source, book, chapter, nextChapterUrl, false)
+                    if (content.isBlank()) throw NoStackTraceException("正文内容为空")
+                    val processedContent = ContentProcessor.get(book)
+                        .getContent(book, chapter, content, false, book.getUseReplaceRule())
+                        .toString()
+                    val currentComparePreview = ChangeSourceAutoCycleMatcher
+                        .buildComparablePreview(processedContent)
+                        ?: throw NoStackTraceException("当前正文有效内容不足")
+                    val currentDisplayPreview = processedContent
+                        .take(ChangeSourceAutoCycleMatcher.DEFAULT_COMPARE_CHAR_COUNT)
+                    val baselineComparePreview = changeSourceViewModel.getAutoCycleCurrentPreview()
+                    val compareResult = ChangeSourceAutoCycleMatcher.comparePreview(
+                        currentPreview = baselineComparePreview,
+                        candidatePreview = currentComparePreview
+                    )
+                    Pair(compareResult, currentDisplayPreview)
+                }
+            }
+            loadingDialog.dismiss()
+            val (compareResult, currentDisplayPreview) = result.getOrElse {
+                alert(title = getString(R.string.auto_change_source_diff_title)) {
+                    setMessage(it.localizedMessage ?: getString(R.string.auto_change_source_diff_empty))
+                    okButton()
+                }
+                return@launch
+            }
+            val message = if (compareResult.sameContent) {
+                getString(R.string.auto_change_source_diff_same_hint, currentDisplayPreview)
+            } else {
+                val currentDiffText = ChangeSourceAutoCycleMatcher.buildDiffDisplay(
+                    currentDisplayPreview.ifBlank { "当前正文为空" },
+                    compareResult.diff
+                )
+                val baselineDiffText = ChangeSourceAutoCycleMatcher.buildDiffDisplay(
+                    baselineDisplayPreview.ifBlank { "基准正文为空" },
+                    compareResult.diff
+                )
+                getString(
+                    R.string.auto_change_source_diff_message,
+                    "当前正文",
+                    baselineDiffText,
+                    currentDiffText
+                )
+            }
+            // 关闭自动换源循环残留的差异弹框，避免多层弹框叠加
+            autoChangeSourceDiffDialog?.dismiss()
+            autoChangeSourceDiffDialog = null
+            val dialog = alert(title = getString(R.string.auto_change_source_diff_title)) {
+                setMessage(message)
+                okButton()
+            }
+            // 无差异时 5 秒后自动关闭
+            if (compareResult.sameContent) {
+                lifecycleScope.launch {
+                    delay(5000)
+                    dialog.dismiss()
+                }
+            }
+        }
+    }
+
+    private fun showAutoChangeSourceDiff(candidate: AutoCycleCandidate, sameAsCurrent: Boolean) {
+        val currentDisplayPreview = changeSourceViewModel.getAutoCycleCurrentDisplayPreview()
+        val diff = candidate.diff
+        val message = if (sameAsCurrent) {
+            getString(
+                R.string.auto_change_source_same_message,
+                candidate.searchBook.originName,
+                candidate.displayPreview.ifBlank { "候选源正文为空" }
+            )
+        } else if (diff == null) {
+            getString(R.string.auto_change_source_diff_empty)
+        } else {
+            // 用 [差异标记] 格式展示两个预览，帮助用户快速定位不同点
+            val currentDiffText = ChangeSourceAutoCycleMatcher.buildDiffDisplay(
+                currentDisplayPreview.ifBlank { "当前基准正文为空" }, diff
+            )
+            val candidateDiffText = ChangeSourceAutoCycleMatcher.buildDiffDisplay(
+                candidate.displayPreview.ifBlank { "候选源正文为空" }, diff
+            )
+            getString(
+                R.string.auto_change_source_diff_message,
+                candidate.searchBook.originName,
+                currentDiffText,
+                candidateDiffText
+            )
+        }
+        autoChangeSourceDiffDialog?.dismiss()
+        autoChangeSourceDiffDialog = alert(title = getString(R.string.auto_change_source_diff_title)) {
+            setMessage(message)
+            okButton()
         }
     }
 

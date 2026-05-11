@@ -589,6 +589,15 @@ object BookHelp {
         return@lazy "[^\\w\\u4E00-\\u9FEF〇\\u3400-\\u4DBF\\u20000-\\u2A6DF\\u2A700-\\u2EBEF]".toRegex()
     }
 
+    /**
+     * 去掉章节标题尾部常见的短元信息，例如"(3K)"、"【2更】"、"[1500字]"、"(最后一章)"。
+     * 与 ChangeSourceAutoCycleMatcher.normalizeChapterTitle 保持一致，
+     * 确保自动换源时 getDurChapter 的章节匹配结果不会因尾部元信息而偏差。
+     */
+    private val trailingMetaRegex by lazy {
+        "(?:[\\[(【(（](?:\\d+(?:\\.\\d+)?(?:[kKwW千萬万字])?|\\d+更|\\d+章|\\d+节|\\d+回|\\d+话|vip|正文|修|加更)[\\])】)）])+$".toRegex()
+    }
+
     @Suppress("RegExpUnnecessaryNonCapturingGroup", "RegExpSimplifiable")
     private val regexB by lazy {
         //章节序号，排除处于结尾的状况，避免将章节名替换为空字串
@@ -604,6 +613,7 @@ object BookHelp {
         return if (chapterName == null) "" else StringUtils.fullToHalf(chapterName)
             .replace(regexA, "")
             .replace(regexB, "")
+            .replace(trailingMetaRegex, "")
             .replace(regexC, "")
             .replace(regexOther, "")
     }

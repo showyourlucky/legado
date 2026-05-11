@@ -24,6 +24,7 @@ import io.legado.app.help.config.AppConfig
 import io.legado.app.help.config.SourceConfig
 import io.legado.app.help.coroutine.Coroutine
 import io.legado.app.help.source.SourceHelp
+import io.legado.app.model.ReadBook
 import io.legado.app.model.webBook.WebBook
 import io.legado.app.utils.internString
 import io.legado.app.utils.mapParallel
@@ -57,6 +58,42 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.math.min
 
+enum class AutoCycleState {
+    Idle,
+    Running,
+    Paused,
+    Completed,
+    Stopped
+}
+
+data class AutoCycleStatus(
+    val state: AutoCycleState = AutoCycleState.Idle,
+    val currentIndex: Int = 0,
+    val total: Int = 0,
+    val sourceName: String = "",
+    val lastSkipReason: String = "",
+    val message: String = ""
+)
+
+data class AutoCycleCandidate(
+    val searchBook: SearchBook,
+    val book: Book,
+    val toc: List<BookChapter>,
+    val source: BookSource,
+    val comparePreview: String,
+    val displayPreview: String,
+    val diff: ChangeSourceAutoCycleMatcher.PreviewDiff? = null
+)
+
+sealed class AutoCycleStepResult {
+    data class Candidate(
+        val candidate: AutoCycleCandidate,
+        val sameAsCurrent: Boolean
+    ) : AutoCycleStepResult()
+
+    object Finished : AutoCycleStepResult()
+}
+
 @Suppress("MemberVisibilityCanBePrivate")
 open class ChangeBookSourceViewModel(application: Application) : BaseViewModel(application) {
     private val threadCount = AppConfig.threadCount
@@ -80,6 +117,13 @@ open class ChangeBookSourceViewModel(application: Application) : BaseViewModel(a
     private val contentProcessor by lazy {
         ContentProcessor.get(oldBook!!)
     }
+    private val _autoCycleStatus = MutableStateFlow(AutoCycleStatus())
+    val autoCycleStatus = _autoCycleStatus.asStateFlow()
+    private var autoCycleQueue = emptyList<SearchBook>()
+    private var autoCycleCurrentIndex = 0
+    private var autoCycleCurrentPreview: String? = null
+    private var autoCycleCurrentDisplayPreview: String? = null
+    private var autoCyclePausedCandidate: AutoCycleCandidate? = null
     private var searchCallback: SourceCallback? = null
     private val chapterNumRegex = "^\\[(\\d+)]".toRegex()
     private val comparatorBase by lazy {
@@ -133,12 +177,7 @@ open class ChangeBookSourceViewModel(application: Application) : BaseViewModel(a
         }
     }.map {
         kotlin.runCatching {
-            val comparator = if (AppConfig.changeSourceLoadWordCount) {
-                wordCountComparator
-            } else {
-                defaultComparator
-            }
-            searchBooks.sortedWith(comparator)
+            getSortedSearchBooks()
         }.onFailure {
             AppLog.put("换源排序出错\n${it.localizedMessage}", it)
         }.getOrDefault(searchBooks)
@@ -446,6 +485,305 @@ open class ChangeBookSourceViewModel(application: Application) : BaseViewModel(a
         task?.cancel()
         searchPool?.close()
         searchStateData.postValue(false)
+    }
+
+    private fun getSortedSearchBooks(): List<SearchBook> {
+        val comparator = if (AppConfig.changeSourceLoadWordCount) {
+            wordCountComparator
+        } else {
+            defaultComparator
+        }
+        return searchBooks.sortedWith(comparator)
+    }
+
+    fun hasSearchResults(): Boolean {
+        return searchBooks.isNotEmpty()
+    }
+
+    fun isAutoCycleActive(): Boolean {
+        return when (_autoCycleStatus.value.state) {
+            AutoCycleState.Running, AutoCycleState.Paused -> true
+            else -> false
+        }
+    }
+
+    fun isAutoCyclePaused(): Boolean {
+        return _autoCycleStatus.value.state == AutoCycleState.Paused
+    }
+
+    fun clearAutoCycleState() {
+        autoCycleQueue = emptyList()
+        autoCycleCurrentIndex = 0
+        autoCycleCurrentPreview = null
+        autoCycleCurrentDisplayPreview = null
+        autoCyclePausedCandidate = null
+        _autoCycleStatus.value = AutoCycleStatus()
+    }
+
+    fun stopAutoCycle(message: String = "") {
+        autoCycleQueue = emptyList()
+        autoCyclePausedCandidate = null
+        autoCycleCurrentPreview = null
+        autoCycleCurrentDisplayPreview = null
+        _autoCycleStatus.value = AutoCycleStatus(
+            state = AutoCycleState.Stopped,
+            message = message.ifBlank { "自动试切已停止" }
+        )
+    }
+
+    fun pauseAutoCycle(message: String = "") {
+        if (_autoCycleStatus.value.state != AutoCycleState.Running) return
+        _autoCycleStatus.value = _autoCycleStatus.value.copy(
+            state = AutoCycleState.Paused,
+            message = message.ifBlank { "已暂停自动试切" }
+        )
+    }
+
+    suspend fun prepareAutoCycle(currentBookUrl: String?): Result<Boolean> {
+        return kotlin.runCatching {
+            if (!fromReadBookActivity) {
+                return@runCatching false
+            }
+            val currentBook = oldBook ?: return@runCatching false
+            val sortedSearchBooks = getSortedSearchBooks()
+            if (sortedSearchBooks.isEmpty()) {
+                return@runCatching false
+            }
+            val currentIndex = sortedSearchBooks.indexOfFirst { it.bookUrl == currentBookUrl }
+            autoCycleQueue = if (currentIndex >= 0) {
+                sortedSearchBooks.drop(currentIndex + 1)
+            } else {
+                sortedSearchBooks.filter { it.bookUrl != currentBook.bookUrl }
+            }
+            if (autoCycleQueue.isEmpty()) {
+                clearAutoCycleState()
+                return@runCatching false
+            }
+            autoCycleCurrentIndex = 0
+            autoCyclePausedCandidate = null
+            loadCurrentChapterPreview(currentBook).let { preview ->
+                autoCycleCurrentPreview = preview.comparePreview
+                autoCycleCurrentDisplayPreview = preview.displayPreview
+            }
+            _autoCycleStatus.value = AutoCycleStatus(
+                state = AutoCycleState.Running,
+                total = autoCycleQueue.size,
+                lastSkipReason = "",
+                message = "自动试切准备完成"
+            )
+            true
+        }
+    }
+
+    suspend fun evaluateNextAutoCycleCandidate(): AutoCycleStepResult {
+        val currentPreview = autoCycleCurrentPreview
+            ?: throw NoStackTraceException("当前源正文不足，无法自动试切")
+        while (autoCycleCurrentIndex < autoCycleQueue.size) {
+            val candidateIndex = autoCycleCurrentIndex
+            val searchBook = autoCycleQueue[candidateIndex]
+            autoCycleCurrentIndex++
+            _autoCycleStatus.value = _autoCycleStatus.value.copy(
+                state = AutoCycleState.Running,
+                currentIndex = candidateIndex + 1,
+                total = autoCycleQueue.size,
+                sourceName = searchBook.originName,
+                message = "自动试切进行中"
+            )
+            val candidateResult = kotlin.runCatching {
+                prepareAutoCycleCandidate(searchBook)
+            }
+            if (candidateResult.isFailure) {
+                val error = candidateResult.exceptionOrNull()
+                if (error is CancellationException) {
+                    throw error
+                }
+                val reason = error?.getReadableAutoCycleReason() ?: "未知错误"
+                AppLog.put("自动试切跳过 ${searchBook.originName}\n$reason")
+                _autoCycleStatus.value = _autoCycleStatus.value.copy(
+                    lastSkipReason = "${searchBook.originName}: $reason"
+                )
+                continue
+            }
+            val candidate = candidateResult.getOrThrow()
+            val compareResult = ChangeSourceAutoCycleMatcher.comparePreview(
+                currentPreview = currentPreview,
+                candidatePreview = candidate.comparePreview
+            )
+            return AutoCycleStepResult.Candidate(
+                candidate = candidate.copy(
+                    comparePreview = compareResult.alignedCandidatePreview,
+                    diff = compareResult.diff
+                ),
+                sameAsCurrent = compareResult.sameContent
+            )
+        }
+        val total = autoCycleQueue.size
+        autoCycleQueue = emptyList()
+        autoCyclePausedCandidate = null
+        _autoCycleStatus.value = _autoCycleStatus.value.copy(
+            state = AutoCycleState.Completed,
+            currentIndex = total,
+            total = total,
+            message = "未找到正文不同的候选源"
+        )
+        return AutoCycleStepResult.Finished
+    }
+
+    fun onAutoCycleCandidateApplied(
+        candidate: AutoCycleCandidate,
+        sameAsCurrent: Boolean
+    ) {
+        autoCyclePausedCandidate = if (sameAsCurrent) {
+            null
+        } else {
+            candidate
+        }
+        _autoCycleStatus.value = _autoCycleStatus.value.copy(
+            state = if (sameAsCurrent) AutoCycleState.Running else AutoCycleState.Paused,
+            sourceName = candidate.searchBook.originName,
+            message = if (sameAsCurrent) {
+                "正文一致，继续尝试下一个源"
+            } else {
+                "正文不同，已暂停自动试切"
+            }
+        )
+    }
+
+    fun pauseAutoCycleForCandidate(candidate: AutoCycleCandidate) {
+        autoCyclePausedCandidate = candidate
+        _autoCycleStatus.value = _autoCycleStatus.value.copy(
+            state = AutoCycleState.Paused,
+            sourceName = candidate.searchBook.originName,
+            message = "正文不同，已暂停自动试切"
+        )
+    }
+
+    fun continueAutoCycle() {
+        if (_autoCycleStatus.value.state != AutoCycleState.Paused) return
+        autoCyclePausedCandidate = null
+        _autoCycleStatus.value = _autoCycleStatus.value.copy(
+            state = AutoCycleState.Running,
+            lastSkipReason = "",
+            message = "继续自动试切"
+        )
+    }
+
+    fun getAutoCycleCurrentPreview(): String {
+        return autoCycleCurrentPreview ?: ""
+    }
+
+    fun getAutoCycleCurrentDisplayPreview(): String {
+        return autoCycleCurrentDisplayPreview ?: ""
+    }
+
+    private suspend fun prepareAutoCycleCandidate(searchBook: SearchBook): AutoCycleCandidate {
+        val currentBook = oldBook ?: throw NoStackTraceException("当前阅读书籍不存在")
+        val candidateBook = bookMap[searchBook.primaryStr()] ?: searchBook.toBook()
+        val candidateToc = tocMap[candidateBook.primaryStr()]
+        val (toc, source) = if (candidateToc != null) {
+            val candidateSource = appDb.bookSourceDao.getBookSource(candidateBook.origin)
+                ?: throw NoStackTraceException("书源不存在")
+            candidateToc to candidateSource
+        } else {
+            val result = getToc(candidateBook).getOrThrow()
+            tocMap[candidateBook.primaryStr()] = result.first
+            bookMap[candidateBook.primaryStr()] = candidateBook
+            result
+        }
+        val chapterIndex = ChangeSourceAutoCycleMatcher.findMatchedChapterIndex(
+            currentTitle = currentBook.durChapterTitle,
+            chapters = toc,
+            currentChapterIndex = currentBook.durChapterIndex,
+            oldChapterListSize = currentBook.totalChapterNum
+        )
+        if (chapterIndex < 0) {
+            throw NoStackTraceException("未找到章节：${currentBook.durChapterTitle}")
+        }
+        val chapter = toc[chapterIndex]
+        val nextChapterUrl = toc.getOrNull(chapterIndex + 1)?.url
+        val comparePreview = loadComparablePreview(
+            source = source,
+            book = candidateBook,
+            chapter = chapter,
+            nextChapterUrl = nextChapterUrl
+        )
+        return AutoCycleCandidate(
+            searchBook = searchBook,
+            book = candidateBook,
+            toc = toc,
+            source = source,
+            comparePreview = comparePreview.comparePreview,
+            displayPreview = comparePreview.displayPreview
+        )
+    }
+
+    private suspend fun loadCurrentChapterPreview(book: Book): LoadedPreview {
+        val source = appDb.bookSourceDao.getBookSource(book.origin)
+            ?: throw NoStackTraceException("当前书源不存在")
+        val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, book.durChapterIndex)
+            ?: throw NoStackTraceException("当前章节不存在")
+        val nextChapterUrl = appDb.bookChapterDao
+            .getChapter(book.bookUrl, book.durChapterIndex + 1)
+            ?.url
+        return loadComparablePreview(
+            source = source,
+            book = book,
+            chapter = chapter,
+            nextChapterUrl = nextChapterUrl
+        )
+    }
+
+    private suspend fun loadComparablePreview(
+        source: BookSource,
+        book: Book,
+        chapter: BookChapter,
+        nextChapterUrl: String?
+    ): LoadedPreview {
+        var content = BookHelp.getContent(book, chapter)
+        if (content.isNullOrBlank()) {
+            content = WebBook.getContentAwait(source, book, chapter, nextChapterUrl, false)
+        }
+        if (content.isBlank()) {
+            throw NoStackTraceException("正文内容为空")
+        }
+        val processedContent = ContentProcessor.get(book)
+            .getContent(
+                book = book,
+                chapter = chapter,
+                content = content,
+                includeTitle = false,
+                useReplace = book.getUseReplaceRule()
+            )
+            .toString()
+        val comparePreview = ChangeSourceAutoCycleMatcher.buildComparablePreview(processedContent)
+            ?: throw NoStackTraceException(
+                "正文有效内容不足${ChangeSourceAutoCycleMatcher.MIN_EFFECTIVE_COMPARE_CHAR_COUNT}字"
+            )
+        return LoadedPreview(
+            comparePreview = comparePreview,
+            displayPreview = processedContent.take(ChangeSourceAutoCycleMatcher.DEFAULT_COMPARE_CHAR_COUNT)
+        )
+    }
+
+    data class LoadedPreview(
+        val comparePreview: String,
+        val displayPreview: String
+    )
+
+    /**
+     * 自动试切经常会包多层异常，直接读 localizedMessage 容易得到空值。
+     * 这里沿着 cause 链取第一个可读中文原因，兜底再返回异常类型名。
+     */
+    private fun Throwable.getReadableAutoCycleReason(): String {
+        var current: Throwable? = this
+        while (current != null) {
+            val message = current.localizedMessage?.trim().orEmpty()
+            if (message.isNotEmpty() && message.lowercase() != "null") {
+                return message
+            }
+            current = current.cause
+        }
+        return this::class.simpleName ?: "未知错误"
     }
 
     fun getToc(

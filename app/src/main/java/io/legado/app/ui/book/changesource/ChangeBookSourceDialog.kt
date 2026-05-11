@@ -9,6 +9,7 @@ import android.widget.ImageButton
 import androidx.appcompat.widget.SearchView
 import androidx.appcompat.widget.Toolbar
 import androidx.core.os.bundleOf
+import androidx.fragment.app.activityViewModels
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.Lifecycle.State.STARTED
 import androidx.lifecycle.lifecycleScope
@@ -44,14 +45,20 @@ import io.legado.app.utils.getCompatDrawable
 import io.legado.app.utils.observeEvent
 import io.legado.app.utils.setLayout
 import io.legado.app.utils.startActivity
+import io.legado.app.utils.toastOnUi
 import io.legado.app.utils.transaction
 import io.legado.app.utils.viewbindingdelegate.viewBinding
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers.IO
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 换源界面
@@ -70,9 +77,15 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
     private val binding by viewBinding(DialogBookChangeSourceBinding::bind)
     private val groups = linkedSetOf<String>()
     private val callBack: CallBack? get() = activity as? CallBack
-    private val viewModel: ChangeBookSourceViewModel by viewModels()
+    private val fragmentViewModel: ChangeBookSourceViewModel by viewModels()
+    private val activityViewModel: ChangeBookSourceViewModel by activityViewModels()
+    private val viewModel: ChangeBookSourceViewModel
+        get() = if (activity is ReadBookActivity) activityViewModel else fragmentViewModel
     private val waitDialog by lazy { WaitDialog(requireContext()) }
     private val adapter by lazy { ChangeBookSourceAdapter(requireContext(), viewModel, this) }
+    private val autoCycleMutex = Mutex()
+    private var autoCycleJob: Job? = null
+    private var handoffAutoCycleToReader = false
     private val editSourceResult =
         registerForActivityResult(StartActivityContract(BookSourceEditActivity::class.java)) {
             val origin = it.data?.getStringExtra("origin") ?: return@registerForActivityResult
@@ -117,6 +130,11 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
 
     override fun onDestroy() {
         super.onDestroy()
+        autoCycleJob?.cancel()
+        if (!handoffAutoCycleToReader) {
+            viewModel.stopSearch()
+            viewModel.clearAutoCycleState()
+        }
         viewModel.searchFinishCallback = null
     }
 
@@ -140,6 +158,9 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
             ?.isChecked = AppConfig.changeSourceLoadToc
         binding.toolBar.menu.findItem(R.id.menu_load_word_count)
             ?.isChecked = AppConfig.changeSourceLoadWordCount
+        binding.toolBar.menu.findItem(R.id.menu_auto_change_source)
+            ?.isVisible = activity is ReadBookActivity
+        updateActionMenu()
     }
 
     private fun initRecyclerView() {
@@ -219,18 +240,7 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
     private fun initLiveData() {
         viewModel.searchStateData.observe(viewLifecycleOwner) {
             binding.refreshProgressBar.isAutoLoading = it
-            if (it) {
-                startStopMenuItem?.let { item ->
-                    item.setIcon(R.drawable.ic_stop_black_24dp)
-                    item.setTitle(R.string.stop)
-                }
-            } else {
-                startStopMenuItem?.let { item ->
-                    item.setIcon(R.drawable.ic_refresh_black_24dp)
-                    item.setTitle(R.string.refresh)
-                }
-            }
-            binding.toolBar.menu.applyTint(requireContext())
+            updateActionMenu()
         }
         lifecycleScope.launch {
             lifecycle.currentStateFlow.first { it.isAtLeast(STARTED) }
@@ -259,6 +269,14 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
         }
 
         lifecycleScope.launch {
+            repeatOnLifecycle(STARTED) {
+                viewModel.autoCycleStatus.collectLatest {
+                    renderAutoCycleStatus(it)
+                }
+            }
+        }
+
+        lifecycleScope.launch {
             appDb.bookSourceDao.flowEnabledGroups().conflate().collect {
                 groups.clear()
                 groups.addAll(it)
@@ -269,6 +287,130 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
 
     private val startStopMenuItem: MenuItem?
         get() = binding.toolBar.menu.findItem(R.id.menu_start_stop)
+
+    private fun updateActionMenu() {
+        startStopMenuItem?.let { item ->
+            if (viewModel.searchStateData.value == true) {
+                item.setIcon(R.drawable.ic_stop_black_24dp)
+                item.setTitle(R.string.stop)
+            } else {
+                item.setIcon(R.drawable.ic_refresh_black_24dp)
+                item.setTitle(R.string.refresh)
+            }
+        }
+        binding.toolBar.menu.findItem(R.id.menu_refresh_list)?.title =
+            getString(R.string.refresh_list)
+        binding.toolBar.menu.applyTint(requireContext())
+    }
+
+    private fun renderAutoCycleStatus(status: AutoCycleStatus) {
+        val skipSuffix = if (status.lastSkipReason.isNotBlank()) {
+            " | 最近跳过：${status.lastSkipReason}"
+        } else {
+            ""
+        }
+        when (status.state) {
+            AutoCycleState.Running -> {
+                binding.tvDur.text = getString(
+                    R.string.auto_change_source_running,
+                    status.currentIndex,
+                    status.total,
+                    status.sourceName
+                ) + skipSuffix
+            }
+
+            AutoCycleState.Paused -> {
+                binding.tvDur.text = getString(
+                    R.string.auto_change_source_paused,
+                    status.sourceName
+                ) + skipSuffix
+                context?.toastOnUi(
+                    getString(
+                        R.string.auto_change_source_paused_hint
+                    )
+                )
+            }
+
+            AutoCycleState.Completed, AutoCycleState.Stopped -> {
+                binding.tvDur.text = status.message.ifBlank {
+                    callBack?.oldBook?.originName.orEmpty()
+                } + skipSuffix
+            }
+
+            AutoCycleState.Idle -> {
+                binding.tvDur.text = callBack?.oldBook?.originName.orEmpty()
+            }
+        }
+        updateActionMenu()
+    }
+
+    private fun startAutoCycleAfterSearchFinished() {
+        if (activity !is ReadBookActivity || !viewModel.hasSearchResults()) {
+            updateActionMenu()
+            return
+        }
+        if (viewModel.isAutoCycleActive() || autoCycleJob?.isActive == true) {
+            return
+        }
+        lifecycleScope.launch {
+            val prepared = viewModel.prepareAutoCycle(oldBookUrl)
+                .getOrElse {
+                    AppLog.put("自动试切准备失败\n${it.localizedMessage}", it, true)
+                    false
+                }
+            if (prepared) {
+                startAutoCycleLoop()
+            } else {
+                updateActionMenu()
+            }
+        }
+    }
+
+    private fun startAutoCycleLoop() {
+        autoCycleJob?.cancel()
+        autoCycleJob = lifecycleScope.launch {
+            autoCycleMutex.withLock {
+                while (true) {
+                    when (val step = viewModel.evaluateNextAutoCycleCandidate()) {
+                        is AutoCycleStepResult.Candidate -> {
+                            val candidate = step.candidate
+                            val changeFinished = CompletableDeferred<Unit>()
+                            applyAutoCycleCandidate(candidate) {
+                                viewModel.onAutoCycleCandidateApplied(candidate, step.sameAsCurrent)
+                                changeFinished.complete(Unit)
+                            }
+                            changeFinished.await()
+                            if (!step.sameAsCurrent) {
+                                break
+                            }
+                        }
+
+                        AutoCycleStepResult.Finished -> break
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyAutoCycleCandidate(
+        candidate: AutoCycleCandidate,
+        onSuccess: (() -> Unit)? = null
+    ) {
+        val target = callBack
+        if (target == null) {
+            onSuccess?.invoke()
+            return
+        }
+        target.changeTo(candidate.source, candidate.book, candidate.toc) {
+            onSuccess?.invoke()
+        }
+    }
+
+    private fun stopAutoCycleAndClose() {
+        autoCycleJob?.cancel()
+        viewModel.stopAutoCycle()
+        dismissAllowingStateLoss()
+    }
 
     override fun onMenuItemClick(item: MenuItem?): Boolean {
         when (item?.itemId) {
@@ -294,10 +436,31 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
                 viewModel.onLoadWordCountChecked(item.isChecked)
             }
 
-            R.id.menu_start_stop -> viewModel.startOrStopSearch()
+            R.id.menu_start_stop -> {
+                viewModel.startOrStopSearch()
+            }
+            R.id.menu_auto_change_source -> {
+                if (viewModel.searchStateData.value == true) {
+                    context?.toastOnUi(R.string.auto_change_source_stop_search_first)
+                    return false
+                }
+                if (!viewModel.hasSearchResults()) {
+                    context?.toastOnUi(R.string.auto_change_source_no_result)
+                    return false
+                }
+                handoffAutoCycleToReader = true
+                callBack?.startAutoChangeSource()
+                dismissAllowingStateLoss()
+            }
             R.id.menu_source_manage -> startActivity<BookSourceActivity>()
-            R.id.menu_close -> dismissAllowingStateLoss()
-            R.id.menu_refresh_list -> viewModel.startRefreshList()
+            R.id.menu_close -> {
+                autoCycleJob?.cancel()
+                dismissAllowingStateLoss()
+            }
+
+            R.id.menu_refresh_list -> {
+                viewModel.startRefreshList()
+            }
             else -> if (item?.groupId == R.id.source_group && !item.isChecked) {
                 item.isChecked = true
                 if (item.title.toString() == getString(R.string.all_source)) {
@@ -308,6 +471,7 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
                 upGroupMenuName()
                 lifecycleScope.launch(IO) {
                     viewModel.stopSearch()
+                    viewModel.clearAutoCycleState()
                     if (viewModel.refresh()) {
                         viewModel.startSearch()
                     }
@@ -328,6 +492,8 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
     }
 
     override fun changeTo(searchBook: SearchBook) {
+        autoCycleJob?.cancel()
+        viewModel.clearAutoCycleState()
         val oldBookType = callBack?.oldBook?.type ?: 0
         if (searchBook.sameBookTypeLocal(oldBookType)) {
             changeSource(searchBook) {
@@ -469,6 +635,16 @@ class ChangeBookSourceDialog() : BaseDialogFragment(R.layout.dialog_book_change_
     interface CallBack {
         val oldBook: Book?
         fun changeTo(source: BookSource, book: Book, toc: List<BookChapter>)
+        fun startAutoChangeSource() {}
+        fun changeTo(
+            source: BookSource,
+            book: Book,
+            toc: List<BookChapter>,
+            onSuccess: (() -> Unit)?
+        ) {
+            changeTo(source, book, toc)
+            onSuccess?.invoke()
+        }
     }
 
 }

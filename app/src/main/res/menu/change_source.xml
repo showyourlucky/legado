@@ -29,6 +29,11 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/menu_auto_change_source"
+        android:title="@string/auto_change_source"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/menu_check_author"
         android:title="@string/checkAuthor"
         android:checkable="true"

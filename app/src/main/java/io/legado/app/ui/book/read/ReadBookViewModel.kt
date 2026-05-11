@@ -282,7 +282,12 @@ class ReadBookViewModel(application: Application) : BaseViewModel(application) {
     /**
      * 换源
      */
-    fun changeTo(book: Book, toc: List<BookChapter>) {
+    fun changeTo(
+        book: Book,
+        toc: List<BookChapter>,
+        loadContent: Boolean = true,
+        onSuccess: (() -> Unit)? = null
+    ) {
         changeSourceCoroutine?.cancel()
         changeSourceCoroutine = execute {
             ReadBook.upMsg(context.getString(R.string.loading))
@@ -293,7 +298,16 @@ class ReadBookViewModel(application: Application) : BaseViewModel(application) {
             appDb.bookChapterDao.insert(*toc.toTypedArray())
             ReadBook.resetData(book)
             ReadBook.upMsg(null)
-            ReadBook.loadContent(resetPageOffset = true)
+            // 数据库操作完成后立即回调，不等待内容加载，
+            // 避免正文需要下载时回调永远不触发导致自动试切卡住
+            onSuccess?.invoke()
+            if (loadContent) {
+                // 手动换源：加载当前章 + 前后章 + 预下载
+                ReadBook.loadContent(resetPageOffset = true)
+            } else {
+                // 自动试切：只加载当前章节，不预加载前后章
+                ReadBook.loadContent(ReadBook.durChapterIndex, resetPageOffset = true)
+            }
         }.onError {
             AppLog.put("换源失败\n$it", it, true)
             ReadBook.upMsg(null)
