@@ -132,14 +132,10 @@ class AiSummaryConfigFragment : PreferenceFragmentCompat(), SharedPreferences.On
             combinedModels.addAll(onlineModels)
         }
 
-        if (combinedModels.isNotEmpty()) {
-            val entries = combinedModels.distinct().toTypedArray()
-            modelIdPreference.entries = entries
-            modelIdPreference.entryValues = entries
-            modelIdPreference.isEnabled = true
-        } else {
-            modelIdPreference.isEnabled = false
-        }
+        val entries = combinedModels.distinct().toTypedArray()
+        modelIdPreference.entries = entries
+        modelIdPreference.entryValues = entries
+        modelIdPreference.isEnabled = entries.isNotEmpty()
     }
 
     private fun fetchModelsFromServer(url: String? = null) {
