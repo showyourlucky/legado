@@ -145,6 +145,10 @@ cn.hutool.core.util.**{*;}
 -keep class org.eclipse.tm4e.** { *; }
 -keep class org.joni.** { *; }
 
+# AiSummaryConfigFragment - Gson 数据类，防止 R8 混淆导致反序列化失败
+-keep class io.legado.app.ui.config.AiSummaryConfigFragment$ModelsResponse { *; }
+-keep class io.legado.app.ui.config.AiSummaryConfigFragment$ModelData { *; }
+
 # GSYVideoPlayer
 -keep class com.shuyu.gsyvideoplayer.** { *; }
 -dontwarn com.shuyu.gsyvideoplayer.**
