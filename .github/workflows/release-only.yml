@@ -3,6 +3,9 @@ name: Release Build (App Only)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
